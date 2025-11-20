@@ -1,0 +1,5 @@
+https://www.capetown.gov.za          # City of Cape Town
+https://www.joburg.org.za            # City of Johannesburg (often uses .org.za)
+https://www.tshwane.gov.za           # City of Tshwane (Pretoria)
+https://www.ethekwini.gov.za         # eThekwini Municipality (Durban)
+https://www.nelsonmandelabay.gov.za  # Nelson Mandela Bay (Gqeberha)
