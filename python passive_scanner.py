@@ -6,6 +6,7 @@ import os
 import time
 from urllib.parse import urlparse
 from collections import defaultdict
+from requests.adapters import HTTPAdapter # Required for retries/session config
 
 # --- CONFIGURATION ---
 TIMEOUT = 7  # Max seconds to wait for a connection/response
@@ -20,55 +21,51 @@ EXPECTED_SECURITY_HEADERS = [
 MAX_RETRIES = 3
 INITIAL_BACKOFF = 1
 
-# --- NEW: PROXY CONFIGURATION ---
-# To bypass WAF/Firewall blocks, uncomment the lines below to route traffic through Tor's local SOCKS5 proxy (port 9050).
-# NOTE: Ensure the Tor service is running on your system (sudo service tor start).
-PROXY_SETTINGS = {
-    'http': 'socks5h://127.0.0.1:9050',
-    'https': 'socks5h://127.0.0.1:9050'
-}
+# --- PROXY CONFIGURATION ---
+# Removed default Tor setting. Use an empty dict for direct connection.
+# If connection fails again, manually re-insert proxy settings here.
+PROXY_SETTINGS = {}
 
-# Standard browser User-Agent to help bypass simple WAF/Bot-detection
+# Standard browser User-Agent
 REQUEST_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.88 Safari/537.36'
 }
 
 # Dictionary of potentially weak protocols to test for passively.
-# Python 3.x typically disables these by default in create_default_context().
 WEAK_PROTOCOLS = {
     'TLSv1': ssl.PROTOCOL_TLSv1, 
     'TLSv1.1': ssl.PROTOCOL_TLSv1_1
 }
 
-def exponential_backoff_fetch(url, method='HEAD', max_retries=MAX_RETRIES, initial_backoff=INITIAL_BACKOFF, headers=None):
+# --------------------------------------------------------------------------
+# REFINEMENT 3: Using a requests.Session for more natural, persistent scanning
+# --------------------------------------------------------------------------
+
+def exponential_backoff_fetch(url, session, method='HEAD', max_retries=MAX_RETRIES, initial_backoff=INITIAL_BACKOFF, headers=None):
     """
-    Performs an HTTP request with exponential backoff for resilience.
-    Uses 'HEAD' for efficiency or 'GET' if redirects need to be fully resolved.
+    Performs an HTTP request using a persistent session with exponential backoff.
     """
     if headers is None:
         headers = REQUEST_HEADERS
         
     for attempt in range(max_retries):
         try:
+            # Use the session for the request, which maintains connection pools and cookies
             if method == 'HEAD':
-                # Pass PROXY_SETTINGS to the requests call
-                response = requests.head(url, timeout=TIMEOUT, allow_redirects=True, headers=headers, proxies=PROXY_SETTINGS) 
+                response = session.head(url, timeout=TIMEOUT, allow_redirects=True, headers=headers, proxies=PROXY_SETTINGS) 
             else:
-                # Pass PROXY_SETTINGS to the requests call
-                response = requests.get(url, timeout=TIMEOUT, allow_redirects=True, headers=headers, proxies=PROXY_SETTINGS) 
+                response = session.get(url, timeout=TIMEOUT, allow_redirects=True, headers=headers, proxies=PROXY_SETTINGS) 
             return response
         except requests.exceptions.RequestException as e:
             if attempt < max_retries - 1:
                 delay = initial_backoff * (2 ** attempt)
-                # print(f"    [Retry] Attempt {attempt + 1} failed for {url}. Retrying in {delay}s...")
                 time.sleep(delay)
             else:
-                # Log the final failure without raising, handle outside
                 return None 
     return None
 
-def check_http_details(url):
-    """Fetches HTTP details, checks headers, status codes, and redirects."""
+def check_http_details(url, session):
+    """Fetches HTTP details, checks headers, status codes, and redirects using the shared session."""
     report = {
         'url': url,
         'status': 'FAIL',
@@ -82,11 +79,10 @@ def check_http_details(url):
     }
     
     try:
-        # Use a GET request to fully resolve redirects and ensure content type is available
-        response = exponential_backoff_fetch(url, method='GET')
+        # Pass the session object here
+        response = exponential_backoff_fetch(url, session, method='GET')
         
         if not response:
-            # If fetch fails after max retries, set a clearer error message
             report['content_issue'] = "CRITICAL: Connection Failed after max retries (Possible WAF/Firewall block or host offline)."
             raise requests.exceptions.RequestException("Max retries exceeded or connection failed.")
 
@@ -111,21 +107,20 @@ def check_http_details(url):
         
         # Check for redirects
         if response.history:
-            # Check the final status code after redirects
             report['redirects'] = f"Found {len(response.history)} redirects ({response.history[0].status_code} -> {response.status_code}), Final URL: {response.url}"
             
     except requests.exceptions.RequestException as e:
         report['status'] = 'ERROR'
-        # content_issue already set if response is None, otherwise use the specific exception
         if report['content_issue'] == 'None':
              report['content_issue'] = f"Request Failed: {e}"
         
     return report
 
+# SSL check functions remain unchanged as they use direct socket connections (bypassing requests/proxy)
+
 def check_ssl_protocol_support(hostname, port, protocol):
     """Helper function to test if a specific SSL protocol is supported."""
     try:
-        # Create context using the specific (and potentially weak) protocol
         context = ssl.SSLContext(protocol)
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
@@ -157,32 +152,25 @@ def check_ssl_details(url):
         return report
 
     try:
-        # Use default context for main connection check (TLS 1.2/1.3 preferred)
         context = ssl.create_default_context()
-        # Note: SSL check bypasses the requests library so it uses a direct socket connection,
-        # making it less susceptible to the WAF blocks affecting HTTP requests.
         with socket.create_connection((hostname, port), timeout=TIMEOUT) as sock:
             with context.wrap_socket(sock, server_hostname=hostname) as ssock:
                 cert_info = ssock.getpeercert()
                 
-                # --- CERTIFICATE DETAILS: CN ---
                 for subject_tuple in cert_info['subject']:
                     for key, value in subject_tuple:
                         if key == 'commonName':
                             report['issued_to'] = value
                             break
                 
-                # --- SAN (Subject Alternate Name) Check ---
                 san_match = False
                 if 'subjectAltName' in cert_info:
                     for type, name in cert_info['subjectAltName']:
                         if type == 'DNS':
-                            # Check for exact match or wildcard match (*.example.com)
                             if name == hostname or (name.startswith('*') and hostname.endswith(name[1:])):
                                 san_match = True
                                 break
                 
-                # Determine match status
                 if san_match:
                     report['san_match'] = 'PASS (SAN Match)'
                 elif report['issued_to'] == hostname:
@@ -190,11 +178,9 @@ def check_ssl_details(url):
                 else:
                     report['san_match'] = 'CRITICAL: FAIL (Domain Mismatch)'
 
-                # --- EXPIRY CHECK ---
                 expiry_date_str = cert_info['notAfter']
                 expiry_date = datetime.datetime.strptime(expiry_date_str, '%b %d %H:%M:%S %Y %Z')
                 
-                # Use timezone-naive comparison after converting to UTC
                 now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
                 expiry_date_naive = expiry_date.replace(tzinfo=None)
                 
@@ -218,7 +204,6 @@ def check_ssl_details(url):
     except Exception as e:
         report['error'] = f'Connection Error (Host might not support HTTPS on 443): {e}'
 
-    # --- WEAK PROTOCOL CHECK ---
     if not report['error']:
         for protocol_name, protocol_const in WEAK_PROTOCOLS.items():
             if check_ssl_protocol_support(hostname, port, protocol_const):
@@ -226,7 +211,7 @@ def check_ssl_details(url):
 
     return report
 
-def check_fingerprint(url, http_data):
+def check_fingerprint(url, http_data, session):
     """
     Passively checks page content and headers for common CMS/technology signatures.
     """
@@ -241,13 +226,12 @@ def check_fingerprint(url, http_data):
     # 1. Check Content (Only do this for successful HTML requests)
     if http_data['status'] == 'OK' and http_data['content_type'].startswith('text/html'):
         try:
-            # Re-fetch the content, max 1MB response size to avoid large downloads
-            response = exponential_backoff_fetch(url, method='GET')
+            # Pass the session object here
+            response = exponential_backoff_fetch(url, session, method='GET')
             if response and response.text:
                 content = response.text
                 
                 for cms, signatures in cms_signatures.items():
-                    # Look for signatures in the HTML content
                     if any(sig in content for sig in signatures):
                         fingerprint.append(cms)
 
@@ -257,7 +241,8 @@ def check_fingerprint(url, http_data):
     # 2. Check for specific common metadata files
     robots_url = urlparse(url)._replace(path='/robots.txt').geturl()
     try:
-        robots_response = exponential_backoff_fetch(robots_url, method='HEAD')
+        # Pass the session object here
+        robots_response = exponential_backoff_fetch(robots_url, session, method='HEAD')
         if robots_response and robots_response.status_code == 200:
              fingerprint.append("robots.txt exposed (Review content)")
     except requests.exceptions.RequestException:
@@ -295,7 +280,6 @@ def generate_report_card(url, http_data, ssl_data, fingerprint_data):
             print("Inferred CMS/Tech: Not detected (minimal exposure)")
 
     # --- SECURITY HEADERS ---
-    # (Refinement 2: Fixed logic to report failure instead of 'EXCELLENT')
     print("\n[ SECURITY HEADERS ]")
     print("-" * 30)
     if is_failed_scan:
@@ -329,12 +313,16 @@ def generate_report_card(url, http_data, ssl_data, fingerprint_data):
     print("="*80)
 
 def main():
-    """Main function to load targets and run the scanner."""
+    """Main function to load targets, initialize session, and run the scanner."""
     targets_file = 'targets.txt'
     
     if not os.path.exists(targets_file):
         print(f"Error: Required file '{targets_file}' not found. Please create it and list URLs.")
         return
+
+    # Initialize a global requests session
+    session = requests.Session()
+    session.headers.update(REQUEST_HEADERS)
 
     with open(targets_file, 'r') as f:
         targets = [line.strip() for line in f if line.strip() and not line.startswith('#')]
@@ -346,21 +334,19 @@ def main():
     print(f"Starting passive scan of {len(targets)} targets...")
     for target_url in targets:
         if not target_url.startswith('http'):
-             # Attempt to default to HTTPS if not specified
              target_url = f"https://{target_url}" 
 
         print(f"\nScanning: {target_url}...")
         
-        # 1. Run HTTP and Content Checks
-        http_data = check_http_details(target_url)
+        # 1. Run HTTP and Content Checks (passing the session)
+        http_data = check_http_details(target_url, session)
         
-        # 2. Run Fingerprint Check
-        # Only run fingerprinting if the HTTP check succeeded (status is not ERROR/FAIL)
+        # 2. Run Fingerprint Check (passing the session)
         fingerprint_data = []
         if http_data['status'] in ['OK', 'ISSUE']:
-            fingerprint_data = check_fingerprint(target_url, http_data)
+            fingerprint_data = check_fingerprint(target_url, http_data, session)
         
-        # 3. Run SSL/TLS Checks (only if the domain is secure/uses HTTPS)
+        # 3. Run SSL/TLS Checks (direct socket connection, no session needed)
         ssl_data = {}
         if target_url.lower().startswith('https'):
             ssl_data = check_ssl_details(target_url)
