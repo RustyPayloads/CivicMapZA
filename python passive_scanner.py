@@ -20,7 +20,15 @@ EXPECTED_SECURITY_HEADERS = [
 MAX_RETRIES = 3
 INITIAL_BACKOFF = 1
 
-# Standard browser User-Agent to help bypass simple WAF/Bot-detection (Refinement 1)
+# --- NEW: PROXY CONFIGURATION ---
+# To bypass WAF/Firewall blocks, uncomment the lines below to route traffic through Tor's local SOCKS5 proxy (port 9050).
+# NOTE: Ensure the Tor service is running on your system (sudo service tor start).
+PROXY_SETTINGS = {
+    'http': 'socks5h://127.0.0.1:9050',
+    'https': 'socks5h://127.0.0.1:9050'
+}
+
+# Standard browser User-Agent to help bypass simple WAF/Bot-detection
 REQUEST_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.88 Safari/537.36'
 }
@@ -43,10 +51,11 @@ def exponential_backoff_fetch(url, method='HEAD', max_retries=MAX_RETRIES, initi
     for attempt in range(max_retries):
         try:
             if method == 'HEAD':
-                # Note: HEAD requests sometimes fail if the server is restrictive, falling back to GET is often needed
-                response = requests.head(url, timeout=TIMEOUT, allow_redirects=True, headers=headers)
+                # Pass PROXY_SETTINGS to the requests call
+                response = requests.head(url, timeout=TIMEOUT, allow_redirects=True, headers=headers, proxies=PROXY_SETTINGS) 
             else:
-                response = requests.get(url, timeout=TIMEOUT, allow_redirects=True, headers=headers)
+                # Pass PROXY_SETTINGS to the requests call
+                response = requests.get(url, timeout=TIMEOUT, allow_redirects=True, headers=headers, proxies=PROXY_SETTINGS) 
             return response
         except requests.exceptions.RequestException as e:
             if attempt < max_retries - 1:
@@ -150,6 +159,8 @@ def check_ssl_details(url):
     try:
         # Use default context for main connection check (TLS 1.2/1.3 preferred)
         context = ssl.create_default_context()
+        # Note: SSL check bypasses the requests library so it uses a direct socket connection,
+        # making it less susceptible to the WAF blocks affecting HTTP requests.
         with socket.create_connection((hostname, port), timeout=TIMEOUT) as sock:
             with context.wrap_socket(sock, server_hostname=hostname) as ssock:
                 cert_info = ssock.getpeercert()
