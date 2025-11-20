@@ -20,6 +20,11 @@ EXPECTED_SECURITY_HEADERS = [
 MAX_RETRIES = 3
 INITIAL_BACKOFF = 1
 
+# Standard browser User-Agent to help bypass simple WAF/Bot-detection (Refinement 1)
+REQUEST_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.88 Safari/537.36'
+}
+
 # Dictionary of potentially weak protocols to test for passively.
 # Python 3.x typically disables these by default in create_default_context().
 WEAK_PROTOCOLS = {
@@ -27,18 +32,21 @@ WEAK_PROTOCOLS = {
     'TLSv1.1': ssl.PROTOCOL_TLSv1_1
 }
 
-def exponential_backoff_fetch(url, method='HEAD', max_retries=MAX_RETRIES, initial_backoff=INITIAL_BACKOFF):
+def exponential_backoff_fetch(url, method='HEAD', max_retries=MAX_RETRIES, initial_backoff=INITIAL_BACKOFF, headers=None):
     """
     Performs an HTTP request with exponential backoff for resilience.
     Uses 'HEAD' for efficiency or 'GET' if redirects need to be fully resolved.
     """
+    if headers is None:
+        headers = REQUEST_HEADERS
+        
     for attempt in range(max_retries):
         try:
             if method == 'HEAD':
                 # Note: HEAD requests sometimes fail if the server is restrictive, falling back to GET is often needed
-                response = requests.head(url, timeout=TIMEOUT, allow_redirects=True)
+                response = requests.head(url, timeout=TIMEOUT, allow_redirects=True, headers=headers)
             else:
-                response = requests.get(url, timeout=TIMEOUT, allow_redirects=True)
+                response = requests.get(url, timeout=TIMEOUT, allow_redirects=True, headers=headers)
             return response
         except requests.exceptions.RequestException as e:
             if attempt < max_retries - 1:
@@ -69,6 +77,8 @@ def check_http_details(url):
         response = exponential_backoff_fetch(url, method='GET')
         
         if not response:
+            # If fetch fails after max retries, set a clearer error message
+            report['content_issue'] = "CRITICAL: Connection Failed after max retries (Possible WAF/Firewall block or host offline)."
             raise requests.exceptions.RequestException("Max retries exceeded or connection failed.")
 
         report['status_code'] = response.status_code
@@ -97,7 +107,9 @@ def check_http_details(url):
             
     except requests.exceptions.RequestException as e:
         report['status'] = 'ERROR'
-        report['content_issue'] = f"Request Failed: {e}"
+        # content_issue already set if response is None, otherwise use the specific exception
+        if report['content_issue'] == 'None':
+             report['content_issue'] = f"Request Failed: {e}"
         
     return report
 
@@ -248,6 +260,8 @@ def generate_report_card(url, http_data, ssl_data, fingerprint_data):
     print(f"🌐 REPORT CARD: {url}")
     print("="*80)
 
+    is_failed_scan = http_data['status'] in ['ERROR', 'FAIL']
+
     # --- HTTP & CONTENT CHECK ---
     print("\n[ HTTP & CONTENT HEALTH ]")
     print("-" * 30)
@@ -259,17 +273,23 @@ def generate_report_card(url, http_data, ssl_data, fingerprint_data):
     # --- TECH STACK & FINGERPRINTING ---
     print("\n[ TECH STACK & FINGERPRINTING ]")
     print("-" * 30)
-    print(f"Server Type:    {http_data['server']}")
-    print(f"Tech Stack:     {http_data['tech_stack']}")
-    if fingerprint_data:
-        print(f"Inferred CMS/Tech: {', '.join(fingerprint_data)}")
+    if is_failed_scan:
+        print("Data:           UNKNOWN (HTTP Scan Failed)")
     else:
-        print("Inferred CMS/Tech: Not detected (minimal exposure)")
+        print(f"Server Type:    {http_data['server']}")
+        print(f"Tech Stack:     {http_data['tech_stack']}")
+        if fingerprint_data:
+            print(f"Inferred CMS/Tech: {', '.join(fingerprint_data)}")
+        else:
+            print("Inferred CMS/Tech: Not detected (minimal exposure)")
 
     # --- SECURITY HEADERS ---
+    # (Refinement 2: Fixed logic to report failure instead of 'EXCELLENT')
     print("\n[ SECURITY HEADERS ]")
     print("-" * 30)
-    if http_data['missing_headers']:
+    if is_failed_scan:
+        print("GRADE: UNKNOWN (HTTP Connection Failed)")
+    elif http_data['missing_headers']:
         print(f"GRADE: DANGER ({len(http_data['missing_headers'])} missing)")
         for header in http_data['missing_headers']:
             print(f"  ❌ Missing: {header}")
@@ -324,7 +344,10 @@ def main():
         http_data = check_http_details(target_url)
         
         # 2. Run Fingerprint Check
-        fingerprint_data = check_fingerprint(target_url, http_data)
+        # Only run fingerprinting if the HTTP check succeeded (status is not ERROR/FAIL)
+        fingerprint_data = []
+        if http_data['status'] in ['OK', 'ISSUE']:
+            fingerprint_data = check_fingerprint(target_url, http_data)
         
         # 3. Run SSL/TLS Checks (only if the domain is secure/uses HTTPS)
         ssl_data = {}
